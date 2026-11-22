@@ -1,0 +1,48 @@
+[package]
+name = "dex-aggregator-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Client of the Intear DEX Aggregator that checks its transactions before they're signed"
+license = "MIT OR Apache-2.0"
+keywords = ["near", "dex", "swap", "aggregator"]
+
+[features]
+near-api = ["dep:near-api"]
+near-kit = ["dep:near-kit"]
+
+[dependencies]
+base64 = "0.22"
+bs58 = "0.5"
+form_urlencoded = "1"
+intear-dex-common = { git = "https://github.com/INTEARnear/dex" }
+intear-dex-types = { git = "https://github.com/INTEARnear/dex" }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+near-account-id = { version = "3", features = ["serde"] }
+near-gas = { version = "0.3", features = ["serde"] }
+near-token = { version = "0.3", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["macros", "sync"] }
+web-time = "1"
+
+near-api = { version = "0.8", optional = true }
+near-kit = { version = "0.34.0-rc.1", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+futures-timer = "3"
+near-sdk = { version = "5.30", default-features = false, features = ["non-contract-usage"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+futures-timer = { version = "3", features = ["wasm-bindgen"] }
+tokio-tungstenite-wasm = "0.9"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+
+[[example]]
+name = "swap"
+required-features = ["near-kit"]
