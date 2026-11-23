@@ -260,6 +260,99 @@ fn a_fee_discount_on_intear_dex() {
     );
 }
 
+mod left_to_the_router {
+    use super::*;
+
+    const NEAR_TO_USDC: &str = "near_to_usdc_exact_in";
+
+    #[track_caller]
+    fn assert_safe(json: Value) {
+        assert_eq!(quote_problems(NEAR_TO_USDC, json), Vec::<String>::new());
+    }
+
+    fn intear_dex() -> Value {
+        quote_json(NEAR_TO_USDC, "IntearDex")
+    }
+
+    #[test]
+    fn fields_of_intear_dex_that_routes_may_add() {
+        assert_safe(tamper(intear_dex(), 0, 0, |args, _| {
+            args["operations"]["new_field"] = "value".into();
+            engine_operation(args, "SwapAdvanced")["new_field"] = "value".into();
+            engine_operation(args, "OracleRequest")["request"] = json!({ "a new": "shape" });
+        }));
+    }
+
+    /// Which only get what Intear DEX can't send to the trader
+    #[test]
+    fn rescue_addresses() {
+        assert_safe(tamper(intear_dex(), 0, 0, |args, _| {
+            engine_operation(args, "OracleRequest")["rescue_address"] = "wallet.intear.near".into();
+            engine_operation(args, "Withdraw")["rescue_address"] = "wallet.intear.near".into();
+        }));
+    }
+
+    #[test]
+    fn withdrawing_to_the_trader() {
+        assert_safe(tamper(intear_dex(), 0, 0, |args, _| {
+            engine_operation(args, "Withdraw")["to"] = "intear.near".into();
+        }));
+        let json = tamper(
+            quote_json("intear_balances_exact_in", "RheaDcl"),
+            0,
+            0,
+            |args, _| {
+                args["amount"] = json!({ "Full": { "at_least": null } });
+                args["withdraw_to"] = "intear.near".into();
+            },
+        );
+        assert_eq!(
+            quote_problems("intear_balances_exact_in", json),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn operations_that_move_none_of_the_traders_assets() {
+        assert_safe(tamper(intear_dex(), 0, 0, |args, _| {
+            let operations = engine_operations(args);
+            operations.insert(
+                0,
+                json!({ "RegisterAssets": { "asset_ids": ["near"], "for": null } }),
+            );
+            operations.insert(1, json!({ "NewOperation": {} }));
+        }));
+    }
+
+    /// Which takes what Intear DEX can't send to the trader
+    #[test]
+    fn registering_the_referrer() {
+        let mut json = intear_dex();
+        json["execution_instructions"]
+            .as_array_mut()
+            .unwrap()
+            .insert(
+                0,
+                transaction(
+                    "dex.intear.near",
+                    vec![one_yocto_call(
+                        "register_assets",
+                        json!({ "asset_ids": ["near"], "for": { "Account": "app.near" } }),
+                    )],
+                    false,
+                ),
+            );
+        let request = SwapRequest {
+            referrer_id: Some("app.near".parse().unwrap()),
+            ..request_of(NEAR_TO_USDC)
+        };
+        assert_eq!(
+            problems(check_quote(&request, &quote(json))),
+            Vec::<String>::new()
+        );
+    }
+}
+
 mod tampered_quotes {
     use super::*;
 
@@ -376,13 +469,23 @@ mod tampered_quotes {
     }
 
     #[test]
-    fn an_argument_that_routes_dont_pass() {
+    fn an_argument_of_rhea_dcl_that_routes_dont_pass() {
         let json = tamper(rhea_dcl(), 0, 1, |args, _| {
             tamper_json(args, "msg", |msg| {
                 msg["Swap"]["receiver_id"] = "evil.near".into()
             });
         });
         assert_unsafe(NEAR_TO_USDC, json, "unknown field `receiver_id`");
+    }
+
+    #[test]
+    fn an_argument_of_rhea_that_routes_dont_pass() {
+        let json = tamper(rhea(), 0, 1, |args, _| {
+            tamper_json(args, "msg", |msg| {
+                msg["swap_out_recipient"] = "evil.near".into()
+            });
+        });
+        assert_unsafe(NEAR_TO_USDC, json, "unknown field `swap_out_recipient`");
     }
 
     #[test]
@@ -431,7 +534,7 @@ mod tampered_quotes {
         assert_unsafe(
             NEAR_TO_USDC,
             json,
-            "invalid type: sequence, expected struct variant Operation::Withdraw",
+            "invalid type: sequence, expected struct EngineWithdraw",
         );
     }
 
@@ -482,31 +585,19 @@ mod tampered_quotes {
     }
 
     #[test]
-    fn an_operation_that_routes_dont_run() {
-        let json = tamper(intear_dex(), 0, 0, |args, _| {
-            engine_operations(args).push(json!({
-                "TransferAsset": { "to": { "Account": "evil.near" }, "asset_id": format!("nep141:{USDC}"), "amount": "1" }
-            }));
-        });
-        assert_unsafe(
-            NEAR_TO_USDC,
-            json,
-            "Runs TransferAsset on Intear DEX, which routes don't",
-        );
-    }
-
-    #[test]
-    fn operations_of_the_engine_that_routes_dont_run() {
+    fn operations_of_the_engine_that_move_the_traders_assets() {
+        let transfer = json!({ "TransferAsset": {
+            "to": { "Account": "evil.near" }, "asset_id": format!("nep141:{USDC}"), "amount": "1"
+        } });
         let dex_call = json!({ "DexCall": {
             "dex_id": "evil.near/dex", "method": "drain", "args": "", "attached_assets": { "near": "1" }
         } });
         let storage =
             json!({ "StorageDeposit": { "amount": "1", "for": { "Account": "evil.near" } } });
-        let register = json!({ "RegisterAssets": { "asset_ids": ["near"], "for": null } });
         for (operation, kind) in [
+            (transfer, "TransferAsset"),
             (dex_call, "DexCall"),
             (storage, "StorageDeposit"),
-            (register, "RegisterAssets"),
         ] {
             let json = tamper(intear_dex(), 0, 0, |args, _| {
                 engine_operations(args).push(operation)
@@ -514,7 +605,7 @@ mod tampered_quotes {
             assert_unsafe(
                 NEAR_TO_USDC,
                 json,
-                &format!("Runs {kind} on Intear DEX, which routes don't"),
+                &format!("Moves the trader's assets with {kind}, which routes don't"),
             );
         }
     }
@@ -544,19 +635,19 @@ mod tampered_quotes {
     }
 
     #[test]
-    fn withdrawing_a_full_balance_from_intear_dex() {
+    fn withdrawing_a_balance_on_intear_dex_to_someone_else() {
         let json = tamper(
             quote_json("intear_balances_exact_in", "RheaDcl"),
             0,
             0,
             |args, _| {
-                args["amount"] = json!({ "Full": { "at_least": null } });
+                args["withdraw_to"] = "evil.near".into();
             },
         );
         assert_unsafe(
             "intear_balances_exact_in",
             json,
-            "Withdraws a full balance, where routes withdraw exact amounts",
+            "Withdraws to someone else than the trader",
         );
     }
 

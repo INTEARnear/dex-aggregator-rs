@@ -7,10 +7,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use intear_dex_common::{AssetId, SwapRequestAmount};
-use intear_dex_types::{
-    AccountOrDexId, DirectWithdrawAmount, Operation, QuoteImprovementFee, ReferralFees,
-    SwapOperationAmount,
-};
+use intear_dex_types::{AccountOrDexId, QuoteImprovementFee, ReferralFees, SwapOperationAmount};
 use near_account_id::{AccountId, AccountIdRef};
 use near_gas::NearGas;
 use near_token::NearToken;
@@ -73,7 +70,10 @@ pub struct UnsafeTransactionsError {
 /// trader allows (the exact input, or the quote's worst case of exact-out) with the fees that the
 /// next steps pay, get at least the quote's worst case of the output, call only the tokens of the
 /// swap and the DEXes the router uses, attach no more to storage deposits than the quote says and
-/// the limits allow, and take fees only for the requested receivers, no more than requested
+/// the limits allow, and take fees only for the requested receivers, no more than requested.
+/// Fields and operations of Intear DEX and of tokens that do none of this are left to the router, so
+/// that it can add them. Rhea and Rhea DCL are called with exactly the arguments that routes pass,
+/// as what others of theirs do isn't known to the checks.
 pub(crate) fn check_quote(
     request: &SwapRequest,
     quote: &Quote,
@@ -448,12 +448,10 @@ impl<'a> TransactionChecker<'a> {
                 add(&mut self.storage_deposits, attached)
             }
             "near_deposit" => {
-                let Empty {} = parse(args)?;
                 wrap_near_only(contract)?;
                 add(&mut self.wrapped, attached)
             }
             "near_withdraw" => {
-                let NearWithdraw { .. } = parse(args)?;
                 wrap_near_only(contract)?;
                 one_yocto(attached)
             }
@@ -544,7 +542,7 @@ impl<'a> TransactionChecker<'a> {
                 one_yocto(attached)
             }
             "storage_deposit" => {
-                let StorageDeposit {
+                let RheaStorageDeposit {
                     registration_only,
                     account_id,
                 } = parse(args)?;
@@ -697,7 +695,10 @@ impl<'a> TransactionChecker<'a> {
     fn intear_dex(&mut self, method: &str, args: &str, attached: u128) -> Result<(), String> {
         match method {
             "storage_deposit" => {
-                let Empty {} = parse(args)?;
+                let AccountStorageDeposit { account_id } = parse(args)?;
+                if let Some(account_id) = account_id {
+                    self.storage_account(&account_id)?;
+                }
                 add(&mut self.storage_deposits, attached)
             }
             "register_assets" => {
@@ -738,13 +739,12 @@ impl<'a> TransactionChecker<'a> {
                 add(&mut self.spent, taken)
             }
             "withdraw" => {
-                let IntearDexWithdraw { asset_id, amount } = parse(args)?;
+                let IntearDexWithdraw {
+                    asset_id,
+                    withdraw_to,
+                } = parse(args)?;
                 one_yocto(attached)?;
-                if !matches!(amount, DirectWithdrawAmount::Exact(_)) {
-                    return Err(
-                        "Withdraws a full balance, where routes withdraw exact amounts".into(),
-                    );
-                }
+                self.withdrawn_to_trader(withdraw_to.as_ref())?;
                 self.own_asset(&asset_id)
             }
             _ => Err("Isn't a call that routes make to Intear DEX".into()),
@@ -754,20 +754,24 @@ impl<'a> TransactionChecker<'a> {
     /// What the operations take out of the trader's balance on Intear DEX
     fn engine_operations(&mut self, args: &EngineOperations) -> Result<u128, String> {
         let referral_fee = self.engine_referral_fees(args.referral_fees.as_ref())?;
+        let operations: Vec<&EngineOperation> = args
+            .operations
+            .iter()
+            .filter(|operation| !matches!(operation, EngineOperation::MovesNoAssets))
+            .collect();
         let mut taken = 0;
         let mut previous_swap = None;
-        for (index, operation) in args.operations.iter().enumerate() {
-            let feeds_next_swap = args
-                .operations
-                .get(index + 1)
-                .and_then(engine_swap)
-                .is_some_and(|next| matches!(next.amount, SwapOperationAmount::OutputOfLastIn));
+        for (index, operation) in operations.iter().enumerate() {
+            let feeds_next_swap = matches!(
+                operations.get(index + 1),
+                Some(EngineOperation::Swap(next))
+                    if matches!(next.amount, SwapOperationAmount::OutputOfLastIn)
+            );
             match operation {
-                Operation::OracleRequest {
+                EngineOperation::OracleRequest(OracleRequest {
                     fee: (fee_asset, fee),
                     swap: None,
-                    ..
-                } => {
+                }) => {
                     if !self.input_assets.contains(fee_asset) {
                         return Err("Pays the oracle in something else than the input".into());
                     }
@@ -775,10 +779,10 @@ impl<'a> TransactionChecker<'a> {
                     add(&mut taken, fee.get())?;
                 }
                 // Buys the oracle's fee with at most `constraint` of the input
-                Operation::OracleRequest {
+                EngineOperation::OracleRequest(OracleRequest {
                     swap: Some(fee_swap),
                     ..
-                } => {
+                }) => {
                     if !self.input_assets.contains(&fee_swap.asset_in) {
                         return Err("Buys the oracle fee with something else than the input".into());
                     }
@@ -788,29 +792,25 @@ impl<'a> TransactionChecker<'a> {
                     oracle_fee_within_limit(&fee_swap.asset_in, constraint.get())?;
                     add(&mut taken, constraint.get())?;
                 }
-                Operation::SwapSimple { .. } | Operation::SwapAdvanced { .. } => {
-                    let swap = engine_swap(operation).expect("Is a swap");
-                    let swap_taken =
-                        self.engine_swap(&swap, previous_swap.as_ref(), feeds_next_swap)?;
+                EngineOperation::Swap(swap) => {
+                    let swap_taken = self.engine_swap(swap, previous_swap, feeds_next_swap)?;
                     add(&mut taken, swap_taken)?;
                 }
-                Operation::Withdraw {
-                    asset_id,
-                    to,
-                    rescue_address,
-                    ..
-                } => {
+                EngineOperation::Withdraw(EngineWithdraw { asset_id, to }) => {
                     self.own_asset(asset_id)?;
-                    if to.is_some() || rescue_address.is_some() {
-                        return Err("Withdraws to someone else than the trader".into());
-                    }
+                    self.withdrawn_to_trader(to.as_ref())?;
                 }
-                Operation::RegisterAssets { .. } => return Err(unrun_operation("RegisterAssets")),
-                Operation::DexCall { .. } => return Err(unrun_operation("DexCall")),
-                Operation::TransferAsset { .. } => return Err(unrun_operation("TransferAsset")),
-                Operation::StorageDeposit { .. } => return Err(unrun_operation("StorageDeposit")),
+                EngineOperation::MovesAssets(kind) => {
+                    return Err(format!(
+                        "Moves the trader's assets with {kind}, which routes don't"
+                    ));
+                }
+                EngineOperation::MovesNoAssets => unreachable!("Left out above"),
             }
-            previous_swap = engine_swap(operation);
+            previous_swap = match operation {
+                EngineOperation::Swap(swap) => Some(swap),
+                _ => None,
+            };
         }
         // Out of an exact-in swap's input, or on top of an exact-out one's within its constraint
         add(&mut self.intear_dex_fees, fraction_of(taken, referral_fee)?)?;
@@ -826,7 +826,7 @@ impl<'a> TransactionChecker<'a> {
         feeds_next_swap: bool,
     ) -> Result<u128, String> {
         let mut taken = 0;
-        match swap.amount {
+        match &swap.amount {
             SwapOperationAmount::OutputOfLastIn => {
                 if !self.exact_in() {
                     return Err(
@@ -841,7 +841,7 @@ impl<'a> TransactionChecker<'a> {
                 return Err("Swaps the entire balance, which routes don't".into());
             }
             SwapOperationAmount::Amount(amount) => {
-                if !self.input_assets.contains(swap.asset_in) {
+                if !self.input_assets.contains(&swap.asset_in) {
                     return Err("Swaps something else than the input".into());
                 }
                 match (amount, self.request.amount) {
@@ -870,14 +870,14 @@ impl<'a> TransactionChecker<'a> {
             }
             return Ok(taken);
         }
-        if !self.output_assets.contains(swap.asset_out) {
+        if !self.output_assets.contains(&swap.asset_out) {
             return Err("Swaps to something else than the output".into());
         }
         let constraint = swap
             .constraint
             .ok_or("The last swap of a chain isn't constrained")?
             .get();
-        self.engine_quote_improvement_fee(swap.quote_improvement_fee)?;
+        self.engine_quote_improvement_fee(swap.quote_improvement_fee.as_ref())?;
         match self.request.amount {
             // Gives exactly the requested output, taking at most the constraint
             SwapAmount::ExactOut(requested) => {
@@ -963,11 +963,25 @@ impl<'a> TransactionChecker<'a> {
                 .request
                 .quote_improvement_receiver
                 .as_ref()
-                .is_some_and(|receiver_id| receiver_id.as_str() == account_id);
+                .is_some_and(|receiver_id| receiver_id.as_str() == account_id)
+            // Takes what Intear DEX can't send to the trader
+            || self
+                .request
+                .referrer_id
+                .as_ref()
+                .is_some_and(|referrer_id| referrer_id.as_str() == account_id);
         if !allowed {
             return Err(format!(
                 "Registers {account_id}, which the swap doesn't pay"
             ));
+        }
+        Ok(())
+    }
+
+    /// Of Intear DEX's withdrawals: the trader's own, when they name an account
+    fn withdrawn_to_trader(&self, account_id: Option<&AccountId>) -> Result<(), String> {
+        if account_id.is_some_and(|account_id| *account_id != self.request.trader_account_id) {
+            return Err("Withdraws to someone else than the trader".into());
         }
         Ok(())
     }
@@ -1087,10 +1101,6 @@ fn oracle_fee_within_limit(asset: &AssetId, amount: u128) -> Result<(), String> 
         ));
     }
     Ok(())
-}
-
-fn unrun_operation(kind: &str) -> String {
-    format!("Runs {kind} on Intear DEX, which routes don't")
 }
 
 /// The assets Intear DEX has the token as: NEAR is both native NEAR and wNEAR
