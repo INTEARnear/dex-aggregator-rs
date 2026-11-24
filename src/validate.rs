@@ -761,6 +761,8 @@ impl<'a> TransactionChecker<'a> {
             .collect();
         let mut taken = 0;
         let mut previous_swap = None;
+        // Of the quote improvement fees of the split swaps, what beats them all
+        let mut quote_improvement_expected = None;
         for (index, operation) in operations.iter().enumerate() {
             let feeds_next_swap = matches!(
                 operations.get(index + 1),
@@ -795,6 +797,11 @@ impl<'a> TransactionChecker<'a> {
                 EngineOperation::Swap(swap) => {
                     let swap_taken = self.engine_swap(swap, previous_swap, feeds_next_swap)?;
                     add(&mut taken, swap_taken)?;
+                    if let Some(expected) =
+                        self.engine_quote_improvement_fee(swap.quote_improvement_fee.as_ref())?
+                    {
+                        add(quote_improvement_expected.get_or_insert(0), expected)?;
+                    }
                 }
                 EngineOperation::Withdraw(EngineWithdraw { asset_id, to }) => {
                     self.own_asset(asset_id)?;
@@ -812,6 +819,19 @@ impl<'a> TransactionChecker<'a> {
                 _ => None,
             };
         }
+        if let Some(expected) = quote_improvement_expected {
+            let estimated = self.estimated()?;
+            let beats_estimate = if self.exact_in() {
+                expected < estimated
+            } else {
+                expected > estimated
+            };
+            if beats_estimate {
+                return Err(format!(
+                    "Takes a quote improvement fee of what beats {expected}, which the quote's estimate of {estimated} doesn't"
+                ));
+            }
+        }
         // Out of an exact-in swap's input, or on top of an exact-out one's within its constraint
         add(&mut self.intear_dex_fees, fraction_of(taken, referral_fee)?)?;
         Ok(taken)
@@ -819,6 +839,7 @@ impl<'a> TransactionChecker<'a> {
 
     /// What the swap takes at most of the input. Exact-in swaps can be chained: each swap of
     /// `OutputOfLastIn` swaps what the one before it gave, and only the last one is constrained.
+    /// They can also be split, each swapping its own part of the input.
     fn engine_swap(
         &mut self,
         swap: &EngineSwap,
@@ -877,7 +898,6 @@ impl<'a> TransactionChecker<'a> {
             .constraint
             .ok_or("The last swap of a chain isn't constrained")?
             .get();
-        self.engine_quote_improvement_fee(swap.quote_improvement_fee.as_ref())?;
         match self.request.amount {
             // Gives exactly the requested output, taking at most the constraint
             SwapAmount::ExactOut(requested) => {
@@ -891,12 +911,13 @@ impl<'a> TransactionChecker<'a> {
         }
     }
 
+    /// What the swap gives or takes before its quote improvement fee takes the rest, if it has one
     fn engine_quote_improvement_fee(
         &self,
         fee: Option<&QuoteImprovementFee>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<u128>, String> {
         let Some(fee) = fee else {
-            return Ok(());
+            return Ok(None);
         };
         if Some(&fee.quote_improvement_receiver) != self.request.quote_improvement_receiver.as_ref()
         {
@@ -904,19 +925,7 @@ impl<'a> TransactionChecker<'a> {
                 "Pays the quote improvement fee to someone else than the requested receiver".into(),
             );
         }
-        let expected = fee.quote_expected_amount.get();
-        let estimated = self.estimated()?;
-        let beats_estimate = if self.exact_in() {
-            expected < estimated
-        } else {
-            expected > estimated
-        };
-        if beats_estimate {
-            return Err(format!(
-                "Takes a quote improvement fee of what beats {expected}, which the quote's estimate of {estimated} doesn't"
-            ));
-        }
-        Ok(())
+        Ok(Some(fee.quote_expected_amount.get()))
     }
 
     /// In millionths of the input

@@ -1523,6 +1523,95 @@ mod chains_of_swaps_on_intear_dex {
     }
 }
 
+mod split_swaps_on_intear_dex {
+    use super::*;
+
+    /// The quote's swap split into two of its own parts of the input, the way the router splits it
+    fn split(change: impl FnOnce(&mut Value)) -> Value {
+        tamper(
+            quote_json("near_to_usdc_exact_in", "IntearDex"),
+            0,
+            0,
+            |args, _| {
+                let operations = engine_operations(args);
+                let index = operations
+                    .iter()
+                    .position(|operation| {
+                        operation
+                            .get("SwapSimple")
+                            .or(operation.get("SwapAdvanced"))
+                            .is_some()
+                    })
+                    .unwrap();
+                let swap = operations[index]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .next()
+                    .unwrap()
+                    .clone();
+                let number = |value: &Value| value.as_str().unwrap().parse::<u128>().unwrap();
+                let amount = number(&swap["amount"]["Amount"]["ExactIn"]);
+                let constraint = number(&swap["constraint"]);
+                let expected = number(&swap["quote_improvement_fee"]["quote_expected_amount"]);
+                let part = |share: &dyn Fn(u128) -> u128| {
+                    let mut fee = swap["quote_improvement_fee"].clone();
+                    fee["quote_expected_amount"] = share(expected).to_string().into();
+                    json!({
+                        "dex_id": "slimedragon.near/xyk",
+                        "message": "",
+                        "asset_in": swap["asset_in"],
+                        "asset_out": swap["asset_out"],
+                        "amount": { "Amount": { "ExactIn": share(amount).to_string() } },
+                        "constraint": share(constraint).to_string(),
+                        "quote_improvement_fee": fee,
+                    })
+                };
+                let first = part(&|whole| whole * 7 / 10);
+                let mut second = part(&|whole| whole - whole * 7 / 10);
+                change(&mut second);
+                operations.splice(
+                    index..=index,
+                    [
+                        json!({ "SwapSimple": first }),
+                        json!({ "SwapSimple": second }),
+                    ],
+                );
+            },
+        )
+    }
+
+    fn one_less(value: &mut Value) {
+        let amount = value.as_str().unwrap().parse::<u128>().unwrap();
+        *value = (amount - 1).to_string().into();
+    }
+
+    #[test]
+    fn a_split_swap() {
+        assert_eq!(
+            quote_problems("near_to_usdc_exact_in", split(|_| {})),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn quote_improvement_fees_of_what_the_estimate_already_has_between_them() {
+        let json =
+            split(|second| one_less(&mut second["quote_improvement_fee"]["quote_expected_amount"]));
+        assert_unsafe(
+            "near_to_usdc_exact_in",
+            json,
+            "Takes a quote improvement fee of what beats",
+        );
+    }
+
+    #[test]
+    fn guaranteeing_less_than_the_worst_case_between_them() {
+        let json = split(|second| one_less(&mut second["constraint"]));
+        assert_unsafe("near_to_usdc_exact_in", json, "The swaps guarantee");
+    }
+}
+
 #[test]
 fn route_query() {
     let request = SwapRequest {
