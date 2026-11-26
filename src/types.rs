@@ -35,6 +35,10 @@ pub struct Quote {
     /// through
     #[serde(deserialize_with = "parsed")]
     pub fee_amount: u128,
+    /// What the route's pools, and the oracle its swap asks, take of its input as fees: 0.003 is
+    /// 0.3%. The referral fees aren't in it.
+    #[serde(deserialize_with = "parsed")]
+    pub pool_fee: f64,
     /// Of a request with `signing_public_key`, once the router found the key
     pub signing: Option<SigningContext>,
     /// What the outcome of its transactions is asked for by
